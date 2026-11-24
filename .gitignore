@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+
+# 機密和本機資料
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.pid
+.judge/
+judge.config.json
+
+# 本機工具
+.agentmux/
+.claude/settings.local.json
+reference/
