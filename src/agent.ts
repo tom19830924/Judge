@@ -75,7 +75,7 @@ const BUTTON_ACTION = "btn:";
 /** 一次最多顯示幾個選項，再多就塞不進一則訊息 */
 export const MAX_ASK_OPTIONS = 20;
 /** /model 第二層一頁最多幾個模型，超過就分頁 */
-export const MODELS_PER_PAGE = 20;
+export const MODELS_PER_PAGE = 10;
 const DEFAULT_TITLE_LENGTH = 30;
 const MAX_TITLE_LENGTH = 60;
 const DEFAULT_HEARTBEAT_MS = 60_000;

@@ -977,7 +977,8 @@ test("/model：模型多到要分頁，有上下頁且頁碼正確", async () =>
   agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(page1, "下一頁 ▶")!.data, messageId: "m1" });
   await waitFor(() => channel.edits.length >= 2);
   const page2 = channel.edits[1]!.rows ?? [];
-  assert.deepEqual(page2.slice(0, -1).map((row) => row[0]!.text), ["gpt-20", "gpt-21", "gpt-22"]);
+  // 第二頁只剩最後 3 個 gpt，加上導覽列
+  assert.deepEqual(page2.slice(0, -1).map((row) => row[0]!.text), ["gpt-10", "gpt-11", "gpt-12"]);
   assert.deepEqual(page2.at(-1)!.map((button) => button.text), ["◀ 上一頁", "⬅️ 返回（2/2）"]);
 });
 
