@@ -1,6 +1,6 @@
 import { ContextTooLongError, WARN_RATIO } from "./context.ts";
 import type { SessionInfo, Store } from "./store.ts";
-import type { ApprovalAnswer, Tool, ToolContext } from "./tools.ts";
+import type { ApprovalAnswer, AskAnswer, Tool, ToolContext } from "./tools.ts";
 import type {
   Channel,
   Command,
@@ -32,15 +32,22 @@ type Dependencies = {
   heartbeatMs?: number;
 };
 
-/** 等用戶按核准的請求 */
-type Approval = {
+/** 用戶按了哪個按鈕；沒按成（新訊息、/stop、送不出按鈕）就是 cancelled */
+type Outcome = { choice: string } | { cancelled: string };
+
+/** 等用戶按按鈕的請求（核准、選項都是） */
+type Pending = {
   chatId: string;
   text: string;
   /** 按鈕那則訊息，用來把按鈕換成結果 */
   messageId: string | undefined;
+  /** 每顆按鈕對應的值，callback_data 只帶索引（Telegram 上限 64 bytes） */
+  values: string[];
   done: boolean;
-  answer?: ApprovalAnswer;
-  finish(answer: ApprovalAnswer): void;
+  outcome?: Outcome;
+  finish(outcome: Outcome): void;
+  /** 結果要怎麼顯示在那則訊息上 */
+  describe(outcome: Outcome): string;
 };
 
 /** 目前這段對話：session 資訊 + 送給模型的完整上下文 */
@@ -57,8 +64,10 @@ type Active = {
 
 const RESUME_LIST_SIZE = 10;
 const RESUME_ACTION = "resume:";
-/** 核准按鈕的資料：approval:<編號>:yes / no */
-const APPROVAL_ACTION = "approval:";
+/** 問用戶的按鈕資料：btn:<編號>:<第幾顆>。只帶索引，選項文字留在記憶體（Telegram 的 callback_data 上限 64 bytes） */
+const BUTTON_ACTION = "btn:";
+/** 一次最多顯示幾個選項，再多就塞不進一則訊息 */
+export const MAX_ASK_OPTIONS = 20;
 const DEFAULT_TITLE_LENGTH = 30;
 const MAX_TITLE_LENGTH = 60;
 const DEFAULT_HEARTBEAT_MS = 60_000;
@@ -83,9 +92,9 @@ export function createAgent(deps: Dependencies) {
   const thinking = new Map<string, AbortController>();
   /** 正在處理的這一輪（推論 + 工具），/stop 時用來中止 */
   const running = new Map<string, AbortController>();
-  /** 等用戶按核准、拒絕的請求。按鈕事件不排隊（排隊會等這輪做完，而這輪正在等按鈕） */
-  const approvals = new Map<string, Approval>();
-  let approvalSeq = 0;
+  /** 等用戶按按鈕的請求。按鈕事件不排隊（排隊會等這輪做完，而這輪正在等按鈕） */
+  const pendings = new Map<string, Pending>();
+  let pendingSeq = 0;
   const toolsByName = new Map(deps.tools.map((tool) => [tool.spec.name, tool]));
   const toolSpecs = deps.tools.map((tool) => tool.spec);
 
@@ -118,8 +127,8 @@ export function createAgent(deps: Dependencies) {
 
     // 模型還在想的話就中止它：這次的訊息已經在上下文裡，會跟新訊息一起重新推論，只回一次
     thinking.get(chatId)?.abort();
-    // 正在等核准的就當作沒核准，工具結果會告訴模型；新訊息照常在下一次推論前併進去
-    cancelApprovals(chatId, "用戶傳了新訊息");
+    // 正在等按鈕的就當作沒回應，工具結果會告訴模型；新訊息照常在下一次推論前併進去
+    cancelPendings(chatId, "用戶傳了新訊息");
 
     // 還沒開始處理的文字訊息併成一批，一起回
     const batch = waiting.get(chatId);
@@ -138,9 +147,9 @@ export function createAgent(deps: Dependencies) {
   }
 
   function handleAction(action: IncomingAction): void {
-    if (action.data.startsWith(APPROVAL_ACTION)) {
+    if (action.data.startsWith(BUTTON_ACTION)) {
       // 不排隊：這輪正卡在等這個按鈕
-      void answerApproval(action);
+      void answerButton(action);
       return;
     }
     enqueue(action.chatId, async () => {
@@ -156,86 +165,115 @@ export function createAgent(deps: Dependencies) {
     });
   }
 
-  // ── 核准 ──
+  // ── 問用戶（按鈕）──
 
-  /** 送出核准、拒絕按鈕，等用戶按。新訊息、/stop（signal）會讓它提早結束 */
-  async function requestApproval(chatId: string, text: string, signal?: AbortSignal): Promise<ApprovalAnswer> {
+  /**
+   * 送出按鈕請用戶選，等他按。新訊息、/stop（signal）會讓它提早結束。
+   * @param rows 每個內層陣列是一排按鈕，值就是回傳的 choice
+   */
+  async function askButtons(
+    chatId: string,
+    text: string,
+    rows: { text: string; value: string }[][],
+    describe: (outcome: Outcome) => string,
+    signal?: AbortSignal,
+  ): Promise<Outcome> {
     if (signal?.aborted) return { cancelled: "已被用戶中止" };
     if (!deps.channel.sendButtons) return { cancelled: "這個通訊軟體不支援按鈕" };
-    const id = String(++approvalSeq);
-    const rows = [
-      [
-        { text: "✅ 核准", data: `${APPROVAL_ACTION}${id}:yes` },
-        { text: "❌ 拒絕", data: `${APPROVAL_ACTION}${id}:no` },
-      ],
-    ];
-    return new Promise<ApprovalAnswer>((resolve) => {
-      const onAbort = () => settleApproval(id, { cancelled: "已被用戶中止" });
-      const approval: Approval = { chatId, text, messageId: undefined, done: false, finish: () => {} };
-      approval.finish = (answer) => {
+    const id = String(++pendingSeq);
+    const values = rows.flat().map((button) => button.value);
+    let index = 0;
+    const keyboard = rows.map((row) => row.map((button) => ({ text: button.text, data: `${BUTTON_ACTION}${id}:${index++}` })));
+
+    return new Promise<Outcome>((resolve) => {
+      const onAbort = () => settlePending(id, { cancelled: "已被用戶中止" });
+      const pending: Pending = { chatId, text, messageId: undefined, values, done: false, finish: () => {}, describe };
+      pending.finish = (outcome) => {
         signal?.removeEventListener("abort", onAbort);
-        resolve(answer);
+        resolve(outcome);
       };
-      approvals.set(id, approval);
+      pendings.set(id, pending);
       signal?.addEventListener("abort", onAbort, { once: true });
-      deps.channel.sendButtons!(chatId, text, rows).then(
+      deps.channel.sendButtons!(chatId, text, keyboard).then(
         (messageId) => {
-          approval.messageId = messageId ?? undefined;
+          pending.messageId = messageId ?? undefined;
           // 按鈕送出前就被取消了：補改訊息
-          if (approval.done) void markApproval(approval);
+          if (pending.done) void markPending(pending);
         },
         (error: unknown) => {
-          console.error(`[${chatId}] 送核准按鈕失敗：${errorMessage(error)}`);
-          settleApproval(id, { cancelled: "送不出核准按鈕" });
+          console.error(`[${chatId}] 送按鈕失敗：${errorMessage(error)}`);
+          settlePending(id, { cancelled: "送不出按鈕" });
         },
       );
     });
   }
 
-  function settleApproval(id: string, answer: ApprovalAnswer): void {
-    const approval = approvals.get(id);
-    if (!approval || approval.done) return;
-    approval.done = true;
-    approval.answer = answer;
-    approvals.delete(id);
-    approval.finish(answer);
-    void markApproval(approval);
+  /** 送出核准、拒絕按鈕，等用戶按 */
+  async function requestApproval(chatId: string, text: string, signal?: AbortSignal): Promise<ApprovalAnswer> {
+    const rows = [
+      [
+        { text: "✅ 核准", value: "yes" },
+        { text: "❌ 拒絕", value: "no" },
+      ],
+    ];
+    const describe = (outcome: Outcome) =>
+      "cancelled" in outcome ? `⏹ 已取消（${outcome.cancelled}）` : outcome.choice === "yes" ? "✅ 已核准" : "❌ 已拒絕";
+    const outcome = await askButtons(chatId, text, rows, describe, signal);
+    if ("cancelled" in outcome) return { cancelled: outcome.cancelled };
+    return outcome.choice === "yes" ? "approved" : "denied";
   }
 
-  function cancelApprovals(chatId: string, reason: string): void {
-    for (const [id, approval] of approvals) {
-      if (approval.chatId === chatId) settleApproval(id, { cancelled: reason });
+  /** 送出選項按鈕請用戶選，回傳他選的那個選項文字。一排一個，長清單比較好按 */
+  async function askUser(chatId: string, question: string, options: string[], signal?: AbortSignal): Promise<AskAnswer> {
+    if (options.length === 0) return { cancelled: "沒有提供選項" };
+    const shown = options.slice(0, MAX_ASK_OPTIONS);
+    const rows = shown.map((option) => [{ text: option, value: option }]);
+    const describe = (outcome: Outcome) => ("cancelled" in outcome ? `⏹ 已取消（${outcome.cancelled}）` : `✅ ${outcome.choice}`);
+    const outcome = await askButtons(chatId, question, rows, describe, signal);
+    return "cancelled" in outcome ? outcome : { chosen: outcome.choice };
+  }
+
+  function settlePending(id: string, outcome: Outcome): void {
+    const pending = pendings.get(id);
+    if (!pending || pending.done) return;
+    pending.done = true;
+    pending.outcome = outcome;
+    pendings.delete(id);
+    pending.finish(outcome);
+    void markPending(pending);
+  }
+
+  function cancelPendings(chatId: string, reason: string): void {
+    for (const [id, pending] of pendings) {
+      if (pending.chatId === chatId) settlePending(id, { cancelled: reason });
     }
   }
 
   /** 把按鈕訊息改成結果，按鈕跟著消失，避免重複按 */
-  async function markApproval(approval: Approval): Promise<void> {
-    if (approval.messageId === undefined || !deps.channel.editMessage || !approval.answer) return;
-    const answer = approval.answer;
-    const result = answer === "approved" ? "✅ 已核准" : answer === "denied" ? "❌ 已拒絕" : `⏹ 已取消（${answer.cancelled}）`;
+  async function markPending(pending: Pending): Promise<void> {
+    if (pending.messageId === undefined || !deps.channel.editMessage || !pending.outcome) return;
     try {
-      await deps.channel.editMessage(approval.chatId, approval.messageId, `${approval.text}
-
-${result}`);
+      await deps.channel.editMessage(pending.chatId, pending.messageId, `${pending.text}\n\n${pending.describe(pending.outcome)}`);
     } catch (error) {
-      console.error(`[${approval.chatId}] 更新核准訊息失敗：${errorMessage(error)}`);
+      console.error(`[${pending.chatId}] 更新按鈕訊息失敗：${errorMessage(error)}`);
     }
   }
 
-  async function answerApproval(action: IncomingAction): Promise<void> {
-    const [id, choice] = action.data.slice(APPROVAL_ACTION.length).split(":");
-    const approval = id === undefined ? undefined : approvals.get(id);
-    if (!approval || approval.chatId !== action.chatId) {
+  async function answerButton(action: IncomingAction): Promise<void> {
+    const [id, index] = action.data.slice(BUTTON_ACTION.length).split(":");
+    const pending = id === undefined ? undefined : pendings.get(id);
+    const choice = pending?.values[Number(index)];
+    if (!pending || pending.chatId !== action.chatId || choice === undefined) {
       // 重啟前的舊按鈕，或已經處理過的
       try {
-        await deps.channel.editMessage?.(action.chatId, action.messageId, "⏹ 這個請求已經失效，沒有寫入。");
+        await deps.channel.editMessage?.(action.chatId, action.messageId, "⏹ 這個請求已經失效，沒有生效。");
       } catch {
         // 改不了就算了
       }
       return;
     }
-    approval.messageId ??= action.messageId;
-    settleApproval(id as string, choice === "yes" ? "approved" : "denied");
+    pending.messageId ??= action.messageId;
+    settlePending(id as string, { choice });
   }
 
   /** /stop：中止推論和正在跑的指令，還沒處理的文字訊息一併丟掉 */
@@ -439,7 +477,11 @@ ${result}`);
   }
 
   function toolContext(chatId: string): ToolContext {
-    return { chatId, requestApproval: (text, signal) => requestApproval(chatId, text, signal) };
+    return {
+      chatId,
+      requestApproval: (text, signal) => requestApproval(chatId, text, signal),
+      askUser: (question, options, signal) => askUser(chatId, question, options, signal),
+    };
   }
 
   async function runTool(chatId: string, call: ToolCallBlock, signal: AbortSignal): Promise<ToolResultBlock> {

@@ -22,7 +22,8 @@ export function buildSystemPrompt(options: {
   - 指令、檔名、程式碼直接寫出來；多行程式碼也直接貼，不加 \`\`\` 圍欄。`,
     `## 工具
 - 你可以讀寫檔案、執行 bash 指令。工作目錄是 ${options.workdir}。
-- 指令沒有 stdin，不能執行需要互動輸入的指令。會跑很久的指令要設定 timeout_seconds。`,
+- 指令沒有 stdin，不能執行需要互動輸入的指令。會跑很久的指令要設定 timeout_seconds。
+- 要用戶做選擇時用 ask_user 給按鈕，不要讓他打字。一次只問一個問題。`,
     `## 關於 IDENTITY.md
 - 開頭的身份、人格、規則來自 ${options.identityPath}。用戶講到這三類（例如「你是我在某公司的代理人」「說話直接一點」「不要幫我 push」），就改這個檔對應的段落，不要用 memory 記。用戶沒講到就不要改。`,
   ];

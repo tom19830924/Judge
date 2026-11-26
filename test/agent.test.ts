@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
-import { createAgent, heartbeatText, mergeTools, STOPPED_NOTE, usageText } from "../src/agent.ts";
+import { createAgent, heartbeatText, MAX_ASK_OPTIONS, mergeTools, STOPPED_NOTE, usageText } from "../src/agent.ts";
 import { openStore } from "../src/store.ts";
 import type { Block, Button, Channel, ChannelHandlers, ModelClient, ModelRequest, ModelResponse } from "../src/types.ts";
-import type { ApprovalAnswer, Tool } from "../src/tools.ts";
+import type { ApprovalAnswer, AskAnswer, Tool } from "../src/tools.ts";
 
 // ── 假的 model：依腳本回應，並記下每次收到的請求  ──
 type Responder = (callIndex: number) => ModelResponse;
@@ -786,9 +786,9 @@ test("核准：等待中打 /stop，就當作沒核准，這輪停下來", async
 
 test("核准：按到失效的按鈕（重啟前的、已處理過的），改成失效說明", async () => {
   const { agent, channel } = setupApproval();
-  agent.handleAction({ chatId: "c1", userId: "u1", data: "approval:999:yes", messageId: "old" });
+  agent.handleAction({ chatId: "c1", userId: "u1", data: "btn:999:0", messageId: "old" });
   await waitFor(() => channel.edits.length >= 1);
-  assert.deepEqual(channel.edits, [{ messageId: "old", text: "⏹ 這個請求已經失效，沒有寫入。" }]);
+  assert.deepEqual(channel.edits, [{ messageId: "old", text: "⏹ 這個請求已經失效，沒有生效。" }]);
 });
 
 test("核准：別的聊天室按不到這個請求", async () => {
@@ -808,6 +808,91 @@ test("核准：通訊軟體不支援按鈕，直接當作沒核准", async () =>
   const { agent, channel, answers } = setupApproval();
   (channel as { sendButtons?: unknown }).sendButtons = undefined;
   agent.handleMessage(msg("c1", "記住甲"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.deepEqual(answers, [{ cancelled: "這個通訊軟體不支援按鈕" }]);
+});
+
+// ── 問用戶選項 ──
+
+/** 會問用戶選項的假工具 */
+function choosingTool(answers: AskAnswer[], options: string[]): Tool {
+  return {
+    spec: { name: "choose", description: "問用戶", inputSchema: { type: "object", properties: {} } },
+    run: async (_input, signal, context) => {
+      if (!context) throw new Error("沒有 context");
+      const answer = await context.askUser("要選哪個？", options, signal);
+      answers.push(answer);
+      return "chosen" in answer ? answer.chosen : `cancelled:${answer.cancelled}`;
+    },
+  };
+}
+
+function setupAsk(options = ["甲", "乙", "丙"]) {
+  const answers: AskAnswer[] = [];
+  const store = openStore(join(mkdtempSync(join(tmpdir(), "bj-agent-")), "test.db"));
+  const channel = new FakeChannel();
+  const model = fakeModel((index) => (index === 0 ? rTool("t1", "choose", {}) : rText("好了")));
+  const agent = createAgent({ model, channel, tools: [choosingTool(answers, options)], store, buildSystemPrompt: () => "測試", contextWindow: 200_000, maxSteps: 30 });
+  return { agent, channel, model, answers };
+}
+
+test("問用戶：每個選項一排按鈕，按了之後工具拿到選項文字", async () => {
+  const { agent, channel, model, answers } = setupAsk();
+  agent.handleMessage(msg("c1", "幫我選"));
+  await waitFor(() => channel.buttons.length >= 1);
+
+  const sent = channel.buttons[0]!;
+  assert.equal(sent.text, "要選哪個？");
+  assert.deepEqual(sent.rows.map((row) => row.map((button) => button.text)), [["甲"], ["乙"], ["丙"]]);
+
+  agent.handleAction({ chatId: "c1", userId: "u1", data: sent.rows[1]![0]!.data, messageId: "btn1" });
+  await waitFor(() => channel.sends.length >= 1);
+  assert.deepEqual(answers, [{ chosen: "乙" }]);
+  assert.equal(toolResultOf(model.requests[1]), "乙");
+  assert.deepEqual(channel.edits, [{ messageId: "btn1", text: "要選哪個？\n\n✅ 乙" }]);
+});
+
+test("問用戶：callback_data 只帶索引，不帶選項文字（Telegram 上限 64 bytes）", async () => {
+  const longOption = "非常長的選項".repeat(20);
+  const { agent, channel, answers } = setupAsk([longOption, "短的"]);
+  agent.handleMessage(msg("c1", "幫我選"));
+  await waitFor(() => channel.buttons.length >= 1);
+
+  const data = channel.buttons[0]!.rows[0]![0]!.data;
+  assert.ok(Buffer.byteLength(data) <= 64, `callback_data 太長：${data}`);
+  agent.handleAction({ chatId: "c1", userId: "u1", data, messageId: "btn1" });
+  await waitFor(() => answers.length >= 1);
+  assert.deepEqual(answers, [{ chosen: longOption }], "索引要對回完整的選項文字");
+});
+
+test("問用戶：選項超過上限就只顯示前面那些", async () => {
+  const options = Array.from({ length: MAX_ASK_OPTIONS + 5 }, (_, index) => `選項${index + 1}`);
+  const { agent, channel, answers } = setupAsk(options);
+  agent.handleMessage(msg("c1", "幫我選"));
+  await waitFor(() => channel.buttons.length >= 1);
+  assert.equal(channel.buttons[0]!.rows.length, MAX_ASK_OPTIONS);
+
+  // 收尾
+  agent.handleMessage(msg("c1", "/stop"));
+  await waitFor(() => answers.length >= 1);
+});
+
+test("問用戶：等待中傳新訊息就當作沒選，新訊息併進下一次推論", async () => {
+  const { agent, channel, model, answers } = setupAsk();
+  agent.handleMessage(msg("c1", "幫我選"));
+  await waitFor(() => channel.buttons.length >= 1);
+
+  agent.handleMessage(msg("c1", "都不要，用丁"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.deepEqual(answers, [{ cancelled: "用戶傳了新訊息" }]);
+  assert.deepEqual(model.requests[1]?.messages.at(-1)?.content.map((block) => block.type), ["tool_result", "text"]);
+  assert.match(channel.edits[0]!.text, /⏹ 已取消（用戶傳了新訊息）$/);
+});
+
+test("問用戶：通訊軟體不支援按鈕，直接當作沒選", async () => {
+  const { agent, channel, answers } = setupAsk();
+  (channel as { sendButtons?: unknown }).sendButtons = undefined;
+  agent.handleMessage(msg("c1", "幫我選"));
   await waitFor(() => channel.sends.length >= 1);
   assert.deepEqual(answers, [{ cancelled: "這個通訊軟體不支援按鈕" }]);
 });

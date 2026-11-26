@@ -33,6 +33,7 @@ function fakeContext(answer: ApprovalAnswer | ((signal?: AbortSignal) => Promise
       asked.push(text);
       return typeof answer === "function" ? answer(signal) : answer;
     },
+    askUser: async () => ({ cancelled: "測試不支援" }),
   };
   return { context, asked };
 }

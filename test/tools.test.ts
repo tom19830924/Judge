@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { createTools, KILL_GRACE_MS, type Tool } from "../src/tools.ts";
+import { createTools, KILL_GRACE_MS, type AskAnswer, type Tool, type ToolContext } from "../src/tools.ts";
 
 function freshWorkdir(): string {
   return mkdtempSync(join(tmpdir(), "bj-tools-"));
@@ -127,4 +127,48 @@ test("run_command：不理 SIGTERM 的程式，寬限後用 SIGKILL 強制終止
 test("工具參數型別錯誤時報錯", async () => {
   const tools = createTools(freshWorkdir(), []);
   await assert.rejects(() => toolByName(tools, "read_file").run({ path: 123 }), /必須是字串/);
+});
+
+// ── ask_user ──
+
+function askContext(answer: AskAnswer) {
+  const asked: { question: string; options: string[] }[] = [];
+  const context: ToolContext = {
+    chatId: "c1",
+    requestApproval: async () => ({ cancelled: "測試不支援" }),
+    askUser: async (question, options) => {
+      asked.push({ question, options });
+      return answer;
+    },
+  };
+  return { context, asked };
+}
+
+test("ask_user：把問題和選項交給 context，回傳用戶選的那個", async () => {
+  const tools = createTools(freshWorkdir(), []);
+  const { context, asked } = askContext({ chosen: "乙" });
+  const result = await toolByName(tools, "ask_user").run({ question: "選哪個？", options: ["甲", "乙"] }, undefined, context);
+  assert.deepEqual(asked, [{ question: "選哪個？", options: ["甲", "乙"] }]);
+  assert.equal(result, "用戶選了：乙");
+});
+
+test("ask_user：用戶沒選時說明原因，不當成錯誤", async () => {
+  const tools = createTools(freshWorkdir(), []);
+  const { context } = askContext({ cancelled: "用戶傳了新訊息" });
+  const result = await toolByName(tools, "ask_user").run({ question: "選哪個？", options: ["甲"] }, undefined, context);
+  assert.equal(result, "用戶沒有選（用戶傳了新訊息）");
+});
+
+test("ask_user：選項不是字串陣列、空陣列時報錯", async () => {
+  const tools = createTools(freshWorkdir(), []);
+  const { context } = askContext({ chosen: "甲" });
+  const ask = toolByName(tools, "ask_user");
+  await assert.rejects(() => ask.run({ question: "？", options: "甲" }, undefined, context), /字串陣列/);
+  await assert.rejects(() => ask.run({ question: "？", options: [1, 2] }, undefined, context), /字串陣列/);
+  await assert.rejects(() => ask.run({ question: "？", options: [] }, undefined, context), /不能是空的/);
+});
+
+test("ask_user：沒有 context（不支援問用戶）時報錯", async () => {
+  const tools = createTools(freshWorkdir(), []);
+  await assert.rejects(() => toolByName(tools, "ask_user").run({ question: "？", options: ["甲"] }), /不支援問用戶/);
 });
