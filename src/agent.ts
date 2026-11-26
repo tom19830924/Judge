@@ -1,7 +1,9 @@
 import { ContextTooLongError, WARN_RATIO } from "./context.ts";
+import { filterModels, groupModels, type ModelGroup } from "./models.ts";
 import type { SessionInfo, Store } from "./store.ts";
 import type { ApprovalAnswer, AskAnswer, Tool, ToolContext } from "./tools.ts";
 import type {
+  Button,
   Channel,
   Command,
   IncomingAction,
@@ -30,6 +32,8 @@ type Dependencies = {
   maxSteps: number;
   /** 處理超過這麼久就顯示「處理中」，之後每隔這麼久更新一次（毫秒），預設 1 分鐘 */
   heartbeatMs?: number;
+  /** /model 換模型：建立新的用戶端並回報上下文上限。沒給就不支援換模型 */
+  switchModel?: (model: string) => { client: ModelClient; contextWindow: number };
 };
 
 /** 用戶按了哪個按鈕；沒按成（新訊息、/stop、送不出按鈕）就是 cancelled */
@@ -64,10 +68,14 @@ type Active = {
 
 const RESUME_LIST_SIZE = 10;
 const RESUME_ACTION = "resume:";
+/** /model 選單的按鈕資料：model:<第幾頁的第幾項>，意義看目前停在哪一層 */
+const MODEL_ACTION = "model:";
 /** 問用戶的按鈕資料：btn:<編號>:<第幾顆>。只帶索引，選項文字留在記憶體（Telegram 的 callback_data 上限 64 bytes） */
 const BUTTON_ACTION = "btn:";
 /** 一次最多顯示幾個選項，再多就塞不進一則訊息 */
 export const MAX_ASK_OPTIONS = 20;
+/** /model 第二層一頁最多幾個模型，超過就分頁 */
+export const MODELS_PER_PAGE = 20;
 const DEFAULT_TITLE_LENGTH = 30;
 const MAX_TITLE_LENGTH = 60;
 const DEFAULT_HEARTBEAT_MS = 60_000;
@@ -79,10 +87,14 @@ export const COMMANDS: Command[] = [
   { name: "new", description: "開新的對話" },
   { name: "resume", description: "恢復之前的對話" },
   { name: "rename", description: "幫目前的對話取名稱，不帶名稱就由模型取" },
+  { name: "model", description: "看目前的模型，或換一個" },
   { name: "reload_prompt", description: "目前的對話改用最新的 system prompt" },
 ];
 
 export function createAgent(deps: Dependencies) {
+  // 目前用的模型和它的上下文上限。/model 可以換掉，所以不是常數
+  let model = deps.model;
+  let contextWindow = deps.contextWindow;
   // 「目前在哪段」只存在記憶體；啟動時用 restoreAll 接回各聊天室最近活動的那段
   const active = new Map<string, Active>();
   const queues = new Map<string, Promise<void>>();
@@ -153,6 +165,7 @@ export function createAgent(deps: Dependencies) {
       return;
     }
     enqueue(action.chatId, async () => {
+      if (action.data.startsWith(MODEL_ACTION)) return handleModelAction(action.chatId, action.data, action.messageId);
       if (!action.data.startsWith(RESUME_ACTION)) return;
       const result = resume(action.chatId, action.data.slice(RESUME_ACTION.length));
       // 把清單那則改成結果，按鈕跟著消失，避免之後誤點舊清單
@@ -379,7 +392,7 @@ export function createAgent(deps: Dependencies) {
     thinking.set(chatId, controller);
     const signal = AbortSignal.any([controller.signal, stopped]);
     try {
-      const response = await deps.model.complete({
+      const response = await model.complete({
         system: frozenPrompt(session),
         messages: session.history,
         tools: frozenTools(session),
@@ -434,7 +447,7 @@ export function createAgent(deps: Dependencies) {
   function startSession(chatId: string, firstText: string): Active {
     const title = shorten(firstText.replace(/\s+/g, " ").trim(), DEFAULT_TITLE_LENGTH) || "（沒有標題）";
     const session: Active = {
-      info: deps.store.createSession(chatId, title, deps.model.model),
+      info: deps.store.createSession(chatId, title, model.model),
       history: [],
       systemPrompt: undefined,
       tools: undefined,
@@ -447,11 +460,11 @@ export function createAgent(deps: Dependencies) {
   /** 存進資料庫、加進上下文、更新記憶體裡的 session 資訊 */
   function append(session: Active, message: Message, usage?: Usage | null): void {
     const inputTokens = usage?.inputTokens ?? null;
-    deps.store.appendMessage(session.info.id, message, { model: deps.model.model, inputTokens });
+    deps.store.appendMessage(session.info.id, message, { model: model.model, inputTokens });
     session.history.push(message);
     session.info.messageCount++;
     session.info.updatedAt = new Date().toISOString();
-    if (message.role === "assistant") session.info.model = deps.model.model;
+    if (message.role === "assistant") session.info.model = model.model;
     if (inputTokens !== null) session.info.lastInputTokens = inputTokens;
   }
 
@@ -467,11 +480,11 @@ export function createAgent(deps: Dependencies) {
 
   async function warnIfNearlyFull(chatId: string, session: Active): Promise<void> {
     const used = session.info.lastInputTokens;
-    if (session.warned || used === null || used < deps.contextWindow * WARN_RATIO) return;
+    if (session.warned || used === null || used < contextWindow * WARN_RATIO) return;
     session.warned = true;
     await reply(
       chatId,
-      `⚠️ 這段對話已用掉約 ${percent(used)} 的上下文（${formatTokens(used)} / ${formatTokens(deps.contextWindow)} token）。` +
+      `⚠️ 這段對話已用掉約 ${percent(used)} 的上下文（${formatTokens(used)} / ${formatTokens(contextWindow)} token）。` +
         "建議打 /new 開新的一段，超過上限就無法繼續了。",
     );
   }
@@ -511,6 +524,8 @@ export function createAgent(deps: Dependencies) {
         return arg === "" ? showResumeList(chatId) : reply(chatId, resumeByNumber(chatId, arg));
       case "rename":
         return rename(chatId, arg);
+      case "model":
+        return showModelMenu(chatId, arg);
       case "reload_prompt":
         return reply(chatId, reloadPrompt(chatId));
       case "start":
@@ -519,6 +534,135 @@ export function createAgent(deps: Dependencies) {
       default:
         return reply(chatId, `不認識的指令：/${name}\n\n${helpText()}`);
     }
+  }
+
+  // ── /model ──
+
+  /** /model 選單目前的狀態，只存記憶體；重啟後舊按鈕就失效 */
+  type ModelMenu = { groups: ModelGroup[]; messageId: string };
+  const modelMenus = new Map<string, ModelMenu>();
+
+  async function showModelMenu(chatId: string, arg: string): Promise<void> {
+    const current = `目前的模型：${model.model}（上下文上限 ${formatTokens(contextWindow)}）`;
+    if (!deps.switchModel) return reply(chatId, `${current}\n\n這個服務商不支援在對話中換模型。`);
+
+    let models: string[];
+    try {
+      if (!model.listModels) throw new Error("這個服務商沒有提供模型清單");
+      models = filterModels(await model.listModels(), arg);
+    } catch (error) {
+      return reply(chatId, `${current}\n\n⚠️ 拿不到模型清單：${errorMessage(error)}\n打 /model 模型名稱 可以直接指定。`);
+    }
+
+    // 直接指定名稱：完全相符就換，不用再選
+    if (arg !== "" && models.length === 1 && models[0] === arg) return applyModel(chatId, arg, undefined);
+    if (models.length === 0) return reply(chatId, `${current}\n\n找不到符合「${arg}」的模型。`);
+
+    const groups = groupModels(models);
+    const header = arg === "" ? current : `${current}\n篩選：${arg}（${models.length} 個）`;
+    // 只有一個廠商（通常是篩選過）就直接進第二層
+    const rows = groups.length === 1 ? modelRows(groups, 0, 0) : vendorRows(groups);
+    const text = groups.length === 1 ? `${header}\n\n${groups[0]!.vendor}：` : `${header}\n\n選廠商：`;
+    if (!deps.channel.sendButtons) {
+      return reply(chatId, `${current}\n\n可用的模型：\n${models.join("\n")}\n\n打 /model 模型名稱 切換。`);
+    }
+    const messageId = await deps.channel.sendButtons(chatId, text, rows);
+    if (typeof messageId === "string") modelMenus.set(chatId, { groups, messageId });
+  }
+
+  function vendorRows(groups: ModelGroup[]): Button[][] {
+    return groups.map((group, index) => [{ text: `${group.vendor}（${group.models.length}）`, data: `${MODEL_ACTION}v:${index}` }]);
+  }
+
+  /** 第二層：某個廠商的模型，一頁 MODELS_PER_PAGE 個，最後一排是翻頁和返回 */
+  function modelRows(groups: ModelGroup[], vendorIndex: number, page: number): Button[][] {
+    const group = groups[vendorIndex];
+    if (!group) return vendorRows(groups);
+    const pages = Math.max(1, Math.ceil(group.models.length / MODELS_PER_PAGE));
+    const current = Math.min(Math.max(page, 0), pages - 1);
+    const start = current * MODELS_PER_PAGE;
+    const rows: Button[][] = group.models.slice(start, start + MODELS_PER_PAGE).map((name, offset) => [
+      { text: `${name === model.model ? "▶ " : ""}${name}`, data: `${MODEL_ACTION}m:${vendorIndex}:${start + offset}` },
+    ]);
+    const nav: Button[] = [];
+    if (current > 0) nav.push({ text: "◀ 上一頁", data: `${MODEL_ACTION}p:${vendorIndex}:${current - 1}` });
+    // 只有一個廠商時（篩選過）返回也回到廠商清單，至少看得到全貌
+    nav.push({ text: `⬅️ 返回${pages > 1 ? `（${current + 1}/${pages}）` : ""}`, data: `${MODEL_ACTION}back` });
+    if (current < pages - 1) nav.push({ text: "下一頁 ▶", data: `${MODEL_ACTION}p:${vendorIndex}:${current + 1}` });
+    rows.push(nav);
+    return rows;
+  }
+
+  /** 點了 /model 選單的按鈕 */
+  async function handleModelAction(chatId: string, data: string, messageId: string): Promise<void> {
+    const menu = modelMenus.get(chatId);
+    if (!menu) {
+      await editOrSend(chatId, messageId, "⏹ 這份模型清單已經失效（可能重啟過），請重打 /model。");
+      return;
+    }
+    menu.messageId = messageId;
+    const [kind, first, second] = data.slice(MODEL_ACTION.length).split(":");
+    if (kind === "back") return void (await editOrSend(chatId, messageId, "選廠商：", vendorRows(menu.groups)));
+    if (kind === "v") return void (await editOrSend(chatId, messageId, vendorTitle(menu, Number(first)), modelRows(menu.groups, Number(first), 0)));
+    if (kind === "p") {
+      return void (await editOrSend(chatId, messageId, vendorTitle(menu, Number(first)), modelRows(menu.groups, Number(first), Number(second))));
+    }
+    if (kind === "m") {
+      const name = menu.groups[Number(first)]?.models[Number(second)];
+      if (name === undefined) return void (await editOrSend(chatId, messageId, "⏹ 找不到這個模型，請重打 /model。"));
+      modelMenus.delete(chatId);
+      return applyModel(chatId, name, messageId);
+    }
+  }
+
+  function vendorTitle(menu: ModelMenu, vendorIndex: number): string {
+    return `${menu.groups[vendorIndex]?.vendor ?? "模型"}（▶ 是目前用的）：`;
+  }
+
+  /** 真的換模型：換掉用戶端、更新上下文上限，並把結果回報給用戶 */
+  async function applyModel(chatId: string, name: string, messageId: string | undefined): Promise<void> {
+    if (!deps.switchModel) return reply(chatId, "這個服務商不支援在對話中換模型。");
+    if (name === model.model) return void (await editOrSend(chatId, messageId, `已經在用 ${name} 了。`));
+
+    let result: string;
+    try {
+      const switched = deps.switchModel(name);
+      const before = model.model;
+      model = switched.client;
+      contextWindow = switched.contextWindow;
+      console.log(`[${chatId}] /model：${before} → ${name}（上下文上限 ${contextWindow}）`);
+      result = `✅ 已換成 ${name}（上下文上限 ${formatTokens(contextWindow)}）。\n所有對話都會用它，重啟後也是。這一次會重寫快取，費用比平常高。`;
+
+      // 目前這段裝不裝得下新模型，先講清楚，免得下一則訊息才發現失敗
+      const used = active.get(chatId)?.info.lastInputTokens ?? null;
+      if (used !== null && used > contextWindow) {
+        result += `\n\n⚠️ 目前這段約 ${formatTokens(used)} token，超過新模型的上限，請打 /new 開新的一段。`;
+      } else if (used !== null && used >= contextWindow * WARN_RATIO) {
+        result += `\n\n⚠️ 目前這段已用掉約 ${percent(used)} 的上下文，建議打 /new。`;
+      }
+    } catch (error) {
+      result = `⚠️ 換不了模型：${errorMessage(error)}`;
+    }
+    await editOrSend(chatId, messageId, result);
+  }
+
+  /** 改寫按鈕那則訊息；沒有訊息 ID 或改寫失敗就另外傳一則 */
+  async function editOrSend(chatId: string, messageId: string | undefined, text: string, rows?: Button[][]): Promise<void> {
+    if (messageId !== undefined && deps.channel.editMessage) {
+      try {
+        await deps.channel.editMessage(chatId, messageId, text, rows);
+        return;
+      } catch (error) {
+        console.error(`[${chatId}] 改寫訊息失敗：${errorMessage(error)}`);
+      }
+    }
+    if (rows && deps.channel.sendButtons) {
+      const sent = await deps.channel.sendButtons(chatId, text, rows);
+      const menu = modelMenus.get(chatId);
+      if (menu && typeof sent === "string") menu.messageId = sent;
+      return;
+    }
+    await reply(chatId, text);
   }
 
   async function showResumeList(chatId: string): Promise<void> {
@@ -572,14 +716,14 @@ export function createAgent(deps: Dependencies) {
 
     // 目前的模型裝不下就不切，免得切進去後每則訊息都失敗
     const used = info.lastInputTokens;
-    if (used !== null && used > deps.contextWindow) {
+    if (used !== null && used > contextWindow) {
       return (
         `❌ 沒有切換：「${info.title}」約 ${formatTokens(used)} token，` +
-        `超過目前模型（${deps.model.model}）的上限 ${formatTokens(deps.contextWindow)}。`
+        `超過目前模型（${model.model}）的上限 ${formatTokens(contextWindow)}。`
       );
     }
 
-    const nearlyFull = used !== null && used >= deps.contextWindow * WARN_RATIO;
+    const nearlyFull = used !== null && used >= contextWindow * WARN_RATIO;
     active.set(chatId, {
       info,
       history: deps.store.loadMessages(info.id),
@@ -635,7 +779,7 @@ export function createAgent(deps: Dependencies) {
       .join("\n\n");
     const excerpt = transcript.length > 20_000 ? `…（前面省略）\n${transcript.slice(-20_000)}` : transcript;
 
-    const response = await deps.model.complete({
+    const response = await model.complete({
       system: "你負責幫對話取名稱。只回名稱本身，20 字以內，用繁體中文，不要引號、標點或任何說明。",
       messages: [{ role: "user", content: [{ type: "text", text: `幫這段對話取名稱：\n\n${excerpt}` }] }],
       tools: [],
@@ -676,17 +820,17 @@ export function createAgent(deps: Dependencies) {
   function describeError(error: unknown): string {
     if (!(error instanceof ContextTooLongError)) return `⚠️ 發生錯誤：${errorMessage(error)}`;
     let text = "⚠️ 這段對話已經超過模型的上下文上限，無法繼續。請打 /new 開新的一段。";
-    if (error.limit !== null && error.limit !== deps.contextWindow) {
+    if (error.limit !== null && error.limit !== contextWindow) {
       text +=
         `\n\n另外，模型回報的實際上限是 ${formatTokens(error.limit)}，` +
-        `但目前設定的是 ${formatTokens(deps.contextWindow)}。` +
+        `但目前設定的是 ${formatTokens(contextWindow)}。` +
         `請在代理人資料夾的 config.json 的 provider.settings 加上 "contextWindow": "${error.limit}"，重啟後生效。`;
     }
     return text;
   }
 
   function percent(used: number | null): string {
-    return `${Math.round(((used ?? 0) / deps.contextWindow) * 100)}%`;
+    return `${Math.round(((used ?? 0) / contextWindow) * 100)}%`;
   }
 
   return { handleMessage, handleAction, restoreAll };

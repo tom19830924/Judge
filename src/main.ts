@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { COMMANDS, createAgent } from "./agent.ts";
 import { findChannel } from "./channels/index.ts";
-import { loadEnv, readConfig, resolveMemoryConfig, resolveSettings } from "./config.ts";
+import { loadEnv, readConfig, resolveMemoryConfig, resolveSettings, writeConfig, type Config } from "./config.ts";
 import { resolveContextWindow } from "./context.ts";
 import { acquireLock, agentPaths, describeAgents, ensureIdentity, judgeHomeText, parseCommand, readIdentity, readMemory, resolveJudgeHome } from "./profile.ts";
 import { createMemoryTool } from "./memory.ts";
@@ -11,6 +11,7 @@ import { findProvider } from "./providers/index.ts";
 import { runSetup } from "./setup.ts";
 import { openStore } from "./store.ts";
 import { createTools } from "./tools.ts";
+import type { ModelClient, Settings } from "./types.ts";
 import { errorMessage } from "./util.ts";
 
 // judge 資料夾：執行的資料夾的 judge.config.json → ~/.judge/config.json → ~/.judge
@@ -77,7 +78,8 @@ if ("workdir" in config) console.warn(`注意：${paths.config} 的 workdir 已�
 
 const providerDefinition = findProvider(config.provider.id);
 const channelDefinition = findChannel(config.channel.id);
-const model = providerDefinition.create(resolveSettings(providerDefinition.fields, config.provider.settings, setupCommand));
+const providerSettings = resolveSettings(providerDefinition.fields, config.provider.settings, setupCommand);
+const model = providerDefinition.create(providerSettings);
 const channel = channelDefinition.create(resolveSettings(channelDefinition.fields, config.channel.settings, setupCommand));
 const secretEnvKeys = [...providerDefinition.fields, ...channelDefinition.fields]
   .filter((field) => field.secret)
@@ -85,6 +87,21 @@ const secretEnvKeys = [...providerDefinition.fields, ...channelDefinition.fields
 
 // 上下文上限可以在設定檔的 provider.settings.contextWindow 指定，沒寫就依模型名稱推斷
 const contextWindow = resolveContextWindow(model.model, config.provider.settings["contextWindow"]);
+
+/**
+ * /model 換模型：用同一個服務商、同一份設定，只換 model，並寫回 config.json 讓重啟後繼續用。
+ * 原本手寫的 contextWindow 是為舊模型設的，一併拿掉，改用新模型推斷出來的
+ */
+const configPath = paths.config;
+let currentConfig: Config = config;
+function switchModel(name: string): { client: ModelClient; contextWindow: number } {
+  const client = providerDefinition.create({ ...providerSettings, model: name });
+  const stored: Settings = { ...currentConfig.provider.settings, model: name };
+  delete stored["contextWindow"];
+  currentConfig = { ...currentConfig, provider: { id: currentConfig.provider.id, settings: stored } };
+  writeConfig(currentConfig, configPath);
+  return { client, contextWindow: resolveContextWindow(name, undefined) };
+}
 
 const agent = createAgent({
   model,
@@ -102,6 +119,7 @@ const agent = createAgent({
     }),
   contextWindow,
   maxSteps: 30,
+  switchModel,
 });
 
 channel.setCommands?.(COMMANDS).catch((error: unknown) => console.error("註冊指令選單失敗：", error));

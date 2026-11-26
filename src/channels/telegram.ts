@@ -1,5 +1,5 @@
 import { requireSetting } from "../config.ts";
-import type { Channel, ChannelDefinition } from "../types.ts";
+import type { Button, Channel, ChannelDefinition } from "../types.ts";
 import { errorMessage, sleep } from "../util.ts";
 
 type Chat = { id: number; type: string };
@@ -114,20 +114,22 @@ function createTelegramChannel(token: string, allowedUserIds: ReadonlySet<string
     },
 
     async sendButtons(chatId, text, rows) {
-      const keyboard = rows.map((row) =>
-        row.map((button) => ({ text: truncateChars(button.text, MAX_BUTTON_TEXT), callback_data: button.data })),
-      );
       const sent = await call<{ message_id: number }>("sendMessage", {
         chat_id: chatId,
         text: truncateChars(text, MAX_MESSAGE_LENGTH),
-        reply_markup: { inline_keyboard: keyboard },
+        reply_markup: { inline_keyboard: toKeyboard(rows) },
       });
       return String(sent.message_id);
     },
 
-    async editMessage(chatId, messageId, text) {
+    async editMessage(chatId, messageId, text, rows) {
       // 沒給 reply_markup，按鈕就會被移除
-      await call("editMessageText", { chat_id: chatId, message_id: Number(messageId), text: truncateChars(text, MAX_MESSAGE_LENGTH) });
+      await call("editMessageText", {
+        chat_id: chatId,
+        message_id: Number(messageId),
+        text: truncateChars(text, MAX_MESSAGE_LENGTH),
+        ...(rows && { reply_markup: { inline_keyboard: toKeyboard(rows) } }),
+      });
     },
 
     async setCommands(commands) {
@@ -136,7 +138,10 @@ function createTelegramChannel(token: string, allowedUserIds: ReadonlySet<string
   };
 }
 
-function truncateChars(text: string, max: number): string {
-  const chars = [...text];
+function toKeyboard(rows: Button[][]) {
+  return rows.map((row) => row.map((button) => ({ text: truncateChars(button.text, MAX_BUTTON_TEXT), callback_data: button.data })));
+}
+
+function truncateChars(text: string, max: number): string {  const chars = [...text];
   return chars.length <= max ? text : chars.slice(0, max - 1).join("") + "…";
 }

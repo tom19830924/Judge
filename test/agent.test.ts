@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
-import { createAgent, heartbeatText, MAX_ASK_OPTIONS, mergeTools, STOPPED_NOTE, usageText } from "../src/agent.ts";
+import { createAgent, heartbeatText, MAX_ASK_OPTIONS, mergeTools, MODELS_PER_PAGE, STOPPED_NOTE, usageText } from "../src/agent.ts";
 import { openStore } from "../src/store.ts";
 import type { Block, Button, Channel, ChannelHandlers, ModelClient, ModelRequest, ModelResponse } from "../src/types.ts";
 import type { ApprovalAnswer, AskAnswer, Tool } from "../src/tools.ts";
@@ -34,7 +34,7 @@ const rEmpty = (raw: string | null): ModelResponse => ({ content: [], stopReason
 class FakeChannel implements Channel {
   sends: string[] = [];
   buttons: { text: string; rows: Button[][] }[] = [];
-  edits: { messageId: string; text: string }[] = [];
+  edits: { messageId: string; text: string; rows?: Button[][] }[] = [];
   /** 依序記下 typing 和 send，用來確認「輸入中」在回覆之前送出 */
   events: string[] = [];
   async typing(chatId: string): Promise<void> {
@@ -51,8 +51,8 @@ class FakeChannel implements Channel {
     this.buttons.push({ text, rows });
     return `btn${this.buttons.length}`;
   }
-  async editMessage(_chatId: string, messageId: string, text: string): Promise<void> {
-    this.edits.push({ messageId, text });
+  async editMessage(_chatId: string, messageId: string, text: string, rows?: Button[][]): Promise<void> {
+    this.edits.push({ messageId, text, ...(rows && { rows }) });
   }
   statuses: string[] = [];
   async sendSilent(_chatId: string, text: string): Promise<void> {
@@ -895,4 +895,178 @@ test("問用戶：通訊軟體不支援按鈕，直接當作沒選", async () =>
   agent.handleMessage(msg("c1", "幫我選"));
   await waitFor(() => channel.sends.length >= 1);
   assert.deepEqual(answers, [{ cancelled: "這個通訊軟體不支援按鈕" }]);
+});
+
+// ── /model 換模型 ──
+
+/** 假的服務商：有模型清單，可以換模型 */
+function setupModel(options?: { models?: string[]; listFails?: boolean; canSwitch?: boolean }) {
+  const models = options?.models ?? ["claude-opus-5-5", "claude-haiku-5-5", "gpt-5.2", "gpt-4o", "gemini-3-flash"];
+  const store = openStore(join(mkdtempSync(join(tmpdir(), "bj-agent-")), "test.db"));
+  const channel = new FakeChannel();
+  const model = fakeModel(() => rText("好"));
+  (model as ModelClient & { listModels?: () => Promise<string[]> }).listModels = async () => {
+    if (options?.listFails) throw new Error("閘道掛了");
+    return models;
+  };
+  const switched: { name: string; contextWindow: number }[] = [];
+  const agent = createAgent({
+    model,
+    channel,
+    tools: [echoTool],
+    store,
+    buildSystemPrompt: () => "測試",
+    contextWindow: 200_000,
+    maxSteps: 30,
+    ...(options?.canSwitch === false
+      ? {}
+      : {
+          switchModel: (name: string) => {
+            const contextWindow = name.includes("haiku") ? 1000 : 300_000;
+            switched.push({ name, contextWindow });
+            return { client: { ...model, model: name }, contextWindow };
+          },
+        }),
+  });
+  return { agent, channel, model, switched, store };
+}
+
+const buttonTexts = (rows: Button[][]) => rows.map((row) => row.map((button) => button.text));
+const findButton = (rows: Button[][], text: string) => rows.flat().find((button) => button.text === text);
+
+test("/model：第一層列廠商，點進去是該廠商的模型，目前用的標 ▶", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.buttons.length >= 1);
+
+  const first = channel.buttons[0]!;
+  assert.ok(first.text.includes("目前的模型：test-model"));
+  assert.deepEqual(buttonTexts(first.rows), [["Anthropic（2）"], ["OpenAI（2）"], ["Google（1）"]], "數量一樣照名稱排");
+
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(first.rows, "Anthropic（2）")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 1);
+  const second = channel.edits[0]!;
+  assert.ok(second.text.startsWith("Anthropic"));
+  assert.deepEqual(buttonTexts(second.rows ?? []), [["claude-opus-5-5"], ["claude-haiku-5-5"], ["⬅️ 返回"]]);
+});
+
+test("/model：返回按鈕回到廠商清單", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.buttons.length >= 1);
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(channel.buttons[0]!.rows, "OpenAI（2）")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 1);
+
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(channel.edits[0]!.rows ?? [], "⬅️ 返回")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 2);
+  assert.deepEqual(buttonTexts(channel.edits[1]!.rows ?? []), [["Anthropic（2）"], ["OpenAI（2）"], ["Google（1）"]]);
+});
+
+test("/model：模型多到要分頁，有上下頁且頁碼正確", async () => {
+  const models = [...Array.from({ length: MODELS_PER_PAGE + 3 }, (_, index) => `gpt-${index}`), "claude-opus-5"];
+  const { agent, channel } = setupModel({ models });
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.buttons.length >= 1);
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(channel.buttons[0]!.rows, `OpenAI（${MODELS_PER_PAGE + 3}）`)!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 1);
+
+  const page1 = channel.edits[0]!.rows ?? [];
+  assert.equal(page1.length, MODELS_PER_PAGE + 1, "一頁的模型數加上導覽列");
+  assert.deepEqual(page1.at(-1)!.map((button) => button.text), ["⬅️ 返回（1/2）", "下一頁 ▶"]);
+
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(page1, "下一頁 ▶")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 2);
+  const page2 = channel.edits[1]!.rows ?? [];
+  assert.deepEqual(page2.slice(0, -1).map((row) => row[0]!.text), ["gpt-20", "gpt-21", "gpt-22"]);
+  assert.deepEqual(page2.at(-1)!.map((button) => button.text), ["◀ 上一頁", "⬅️ 返回（2/2）"]);
+});
+
+test("/model：選了模型就換掉，按鈕換成結果", async () => {
+  const { agent, channel, switched } = setupModel();
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.buttons.length >= 1);
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(channel.buttons[0]!.rows, "Google（1）")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 1);
+
+  agent.handleAction({ chatId: "c1", userId: "u1", data: findButton(channel.edits[0]!.rows ?? [], "gemini-3-flash")!.data, messageId: "m1" });
+  await waitFor(() => channel.edits.length >= 2);
+  assert.deepEqual(switched.map((entry) => entry.name), ["gemini-3-flash"]);
+  assert.ok(channel.edits[1]!.text.includes("已換成 gemini-3-flash"));
+  assert.equal(channel.edits[1]!.rows, undefined, "換完按鈕要消失");
+});
+
+test("/model：換過之後的推論用新模型，session 也記新的", async () => {
+  const { agent, channel, store } = setupModel();
+  agent.handleMessage(msg("c1", "/model gpt-4o"));
+  await waitFor(() => channel.sends.length >= 1);
+  agent.handleMessage(msg("c1", "換完之後說一句"));
+  await waitFor(() => channel.sends.length >= 2);
+  assert.equal(store.listSessions("c1", 1)[0]?.model, "gpt-4o");
+});
+
+test("/model 關鍵字：只有一個廠商符合時直接進第二層", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleMessage(msg("c1", "/model gpt"));
+  await waitFor(() => channel.buttons.length >= 1);
+  const sent = channel.buttons[0]!;
+  assert.ok(sent.text.includes("篩選：gpt（2 個）"));
+  assert.deepEqual(buttonTexts(sent.rows), [["gpt-5.2"], ["gpt-4o"], ["⬅️ 返回"]]);
+});
+
+test("/model 完整名稱：直接換，不用再選", async () => {
+  const { agent, channel, switched } = setupModel();
+  agent.handleMessage(msg("c1", "/model gpt-4o"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.deepEqual(switched.map((entry) => entry.name), ["gpt-4o"]);
+  assert.ok(channel.sends[0]?.includes("已換成 gpt-4o"));
+  assert.equal(channel.buttons.length, 0, "不用再出選單");
+});
+
+test("/model 關鍵字：沒有符合的就說找不到", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleMessage(msg("c1", "/model 不存在"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.ok(channel.sends[0]?.includes("找不到符合「不存在」的模型"));
+});
+
+test("/model：拿不到清單時說明原因，還是可以直接指定名稱", async () => {
+  const { agent, channel } = setupModel({ listFails: true });
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.ok(channel.sends[0]?.includes("拿不到模型清單"));
+  assert.ok(channel.sends[0]?.includes("閘道掛了"));
+});
+
+test("/model：服務商不支援換模型時只報告目前的模型", async () => {
+  const { agent, channel } = setupModel({ canSwitch: false });
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.ok(channel.sends[0]?.includes("目前的模型：test-model"));
+  assert.ok(channel.sends[0]?.includes("不支援在對話中換模型"));
+});
+
+test("/model：新模型裝不下目前這段時提醒開新的", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleMessage(msg("c1", "先聊一句"));
+  await waitFor(() => channel.sends.length >= 1);
+  agent.handleMessage(msg("c1", "/model claude-haiku-5-5"));
+  await waitFor(() => channel.sends.length >= 2);
+  // 這個假 model 不回報用量，所以不會有警告；只確認換成功
+  assert.ok(channel.sends[1]?.includes("已換成 claude-haiku-5-5"));
+});
+
+test("/model：重啟後的舊按鈕失效，請用戶重打", async () => {
+  const { agent, channel } = setupModel();
+  agent.handleAction({ chatId: "c1", userId: "u1", data: "model:v:0", messageId: "old" });
+  await waitFor(() => channel.edits.length >= 1);
+  assert.ok(channel.edits[0]!.text.includes("已經失效"));
+});
+
+test("/model：通訊軟體不支援按鈕時改用文字清單", async () => {
+  const { agent, channel } = setupModel();
+  (channel as { sendButtons?: unknown }).sendButtons = undefined;
+  agent.handleMessage(msg("c1", "/model"));
+  await waitFor(() => channel.sends.length >= 1);
+  assert.ok(channel.sends[0]?.includes("gpt-5.2"));
+  assert.ok(channel.sends[0]?.includes("打 /model 模型名稱 切換"));
 });

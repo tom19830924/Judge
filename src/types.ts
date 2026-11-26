@@ -30,6 +30,8 @@ export interface ModelClient {
   /** 模型名稱，記進 session、查上下文上限用 */
   readonly model: string;
   complete(request: ModelRequest): Promise<ModelResponse>;
+  /** 服務商提供的模型清單。不支援的服務商不實作，呼叫端要自己處理 */
+  listModels?(): Promise<string[]>;
 }
 
 export type IncomingMessage = { chatId: string; userId: string; text: string };
@@ -53,8 +55,8 @@ export interface Channel {
   sendButtons?(chatId: string, text: string, rows: Button[][]): Promise<string | void>;
   /** 傳一則不跳通知的狀態訊息（例如「處理中」）。不支援的通訊軟體不實作，呼叫端改用 send */
   sendSilent?(chatId: string, text: string): Promise<void>;
-  /** 改寫一則已送出的訊息，按鈕會一併移除 */
-  editMessage?(chatId: string, messageId: string, text: string): Promise<void>;
+  /** 改寫一則已送出的訊息。不給 rows 時按鈕會被移除，給了就換成新的按鈕 */
+  editMessage?(chatId: string, messageId: string, text: string, rows?: Button[][]): Promise<void>;
   /** 註冊指令選單（輸入框旁的指令清單） */
   setCommands?(commands: Command[]): Promise<void>;
 }

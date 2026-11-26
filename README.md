@@ -85,9 +85,12 @@ judge 資料夾（放代理人的地方）依序找：
 | `/new` | 開新的對話，舊的留著 |
 | `/resume` | 列出最近 10 段對話，點按鈕切換；也可以打 `/resume 編號` |
 | `/rename 名稱` | 幫目前的對話取名稱，不帶名稱就由模型取 |
+| `/model` | 看目前的模型，或換一個：先選廠商再選模型，可翻頁和返回 |
 | `/reload_prompt` | 目前的對話改用最新的 system prompt |
 
 對話紀錄存在 `judge.db`，重啟後會自動接回每個聊天室最近的那段。沒取名的對話用第一句話的前 30 字當名稱。
+
+`/model` 的清單來自服務商的 `GET /v1/models`，依模型名稱分成 Anthropic、OpenAI、Google 等廠商。`/model 關鍵字` 可以先篩選，`/model 完整名稱` 直接換。換掉之後所有對話都用新模型，並寫回 `config.json`，重啟後繼續用。
 
 ### 記憶
 
@@ -164,7 +167,8 @@ npm run typecheck                     # 型別檢查
 src/
 ├── main.ts          入口：選代理人、讀設定，把零件組起來
 ├── agent.ts         迴圈：問模型 → 執行工具 → 再問，直到完成；Telegram 指令
-├── tools.ts         工具：read_file、write_file、edit_file、run_command
+├── tools.ts         工具：read_file、write_file、edit_file、run_command、ask_user
+├── models.ts        /model 選單：模型清單依廠商分組、關鍵字篩選
 ├── memory.ts        記憶工具：MEMORY.md 的新增、修改、刪除
 ├── prompt.ts        system prompt 的通用部分
 ├── store.ts         對話紀錄（SQLite）

@@ -139,3 +139,55 @@ test("complete：沒帶工具的一次性請求不標記", async () => {
   assert.equal(body.system, "規則");
   assert.equal(JSON.stringify(body.messages).includes("cache_control"), false);
 });
+
+// ── listModels ──
+
+/** 用假的 fetch 回應模型清單，並記下請求過的網址 */
+async function listWith(pages: { data: { id: string }[]; has_more?: boolean; last_id?: string }[]): Promise<{ models: string[]; urls: string[] }> {
+  const original = globalThis.fetch;
+  const urls: string[] = [];
+  let index = 0;
+  globalThis.fetch = (async (url: string) => {
+    urls.push(url);
+    const page = pages[index++] ?? { data: [] };
+    return new Response(JSON.stringify(page), { status: 200 });
+  }) as unknown as typeof fetch;
+  try {
+    const client = createAnthropicMessagesClient({ baseUrl: "http://x/", apiKey: "k", model: "m", maxTokens: 10 });
+    return { models: (await client.listModels?.()) ?? [], urls };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("listModels：取出模型 id，網址用 baseUrl 的 /v1/models", async () => {
+  const { models, urls } = await listWith([{ data: [{ id: "a" }, { id: "b" }] }]);
+  assert.deepEqual(models, ["a", "b"]);
+  assert.ok(urls[0]?.startsWith("http://x/v1/models?"), String(urls[0]));
+});
+
+test("listModels：has_more 時接著往下拿，用 last_id 當游標", async () => {
+  const { models, urls } = await listWith([
+    { data: [{ id: "a" }], has_more: true, last_id: "a" },
+    { data: [{ id: "b" }] },
+  ]);
+  assert.deepEqual(models, ["a", "b"]);
+  assert.ok(urls[1]?.includes("after_id=a"), String(urls[1]));
+});
+
+test("listModels：has_more 但沒有 last_id 就停，不無限翻", async () => {
+  const { models, urls } = await listWith([{ data: [{ id: "a" }], has_more: true }]);
+  assert.deepEqual(models, ["a"]);
+  assert.equal(urls.length, 1);
+});
+
+test("listModels：API 失敗時丟出錯誤", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("掛了", { status: 500 })) as unknown as typeof fetch;
+  try {
+    const client = createAnthropicMessagesClient({ baseUrl: "http://x", apiKey: "k", model: "m", maxTokens: 10 });
+    await assert.rejects(() => client.listModels!(), /500/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

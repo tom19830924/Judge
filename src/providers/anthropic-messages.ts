@@ -22,12 +22,33 @@ type WireUsage = {
 };
 type WireResponse = { content: WireBlock[]; stop_reason: string | null; usage?: WireUsage };
 
+type WireModelList = { data?: { id?: string }[]; has_more?: boolean; last_id?: string | null };
+
+/** 一次最多翻幾頁模型清單，避免服務商回了壞掉的分頁就無限翻 */
+const MAX_MODEL_PAGES = 10;
+
 /** Anthropic Messages API 格式的用戶端。凡是相容這個格式的服務商都能共用 */
 export function createAnthropicMessagesClient(options: Options): ModelClient {
-  const url = `${options.baseUrl.replace(/\/+$/, "")}/v1/messages`;
+  const base = options.baseUrl.replace(/\/+$/, "");
+  const url = `${base}/v1/messages`;
 
   return {
     model: options.model,
+
+    /** GET /v1/models，服務商有分頁就一頁頁拿完 */
+    async listModels() {
+      const models: string[] = [];
+      let after: string | undefined;
+      for (let page = 1; page <= MAX_MODEL_PAGES; page++) {
+        const query = new URLSearchParams({ limit: "1000", ...(after ? { after_id: after } : {}) });
+        const wire = (await get(`${base}/v1/models?${query}`, options.apiKey)) as WireModelList;
+        for (const model of wire.data ?? []) if (model.id) models.push(model.id);
+        if (!wire.has_more || !wire.last_id) break;
+        after = wire.last_id;
+      }
+      return models;
+    },
+
     async complete(request) {
       // 沒帶工具的是一次性請求（例如 /rename 取名稱），之後不會再讀到，標記只會白付寫入費
       const cache = (options.promptCache ?? true) && request.tools.length > 0;
@@ -49,6 +70,15 @@ export function createAnthropicMessagesClient(options: Options): ModelClient {
       return fromWire((await post(url, options.apiKey, body, request.signal)) as WireResponse);
     },
   };
+}
+
+async function get(url: string, apiKey: string): Promise<unknown> {
+  const response = await fetch(url, {
+    headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) throw new Error(`模型 API 錯誤 ${response.status}：${(await response.text()).slice(0, 200)}`);
+  return response.json();
 }
 
 async function post(url: string, apiKey: string, body: unknown, cancel?: AbortSignal): Promise<unknown> {
