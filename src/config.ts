@@ -4,9 +4,12 @@ import type { Settings, SetupField } from "./types.ts";
 
 export type Selection = { id: string; settings: Settings };
 /** 代理人資料夾的 config.json。工作目錄不在這裡設定，用啟動時的目錄 */
-export type Config = { provider: Selection; channel: Selection; memory?: MemoryConfig };
+export type Config = { provider: Selection; channel: Selection; memory?: MemoryConfig; maxSteps?: number };
 /** 記憶設定，都可以不寫。approval：寫入前先問用戶（預設 false）；charLimit：MEMORY.md 字數上限（預設 2200） */
 export type MemoryConfig = { approval?: boolean; charLimit?: number };
+
+/** 一則訊息最多跟模型來回幾次。防無限循環用，不是模型或 API 的限制 */
+export const DEFAULT_MAX_STEPS = 30;
 
 /** 讀代理人的 .env。專案根目錄的 .env 不讀 */
 export function loadEnv(path: string): void {
@@ -38,8 +41,16 @@ export function resolveMemoryConfig(memory: unknown, path = "config.json"): Requ
   return { approval, charLimit };
 }
 
-export function writeConfig(config: Config, path: string): void {
-  writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+/** config.json 的 maxSteps；沒寫就用預設值。型別不對就報錯，不要默默用預設值 */
+export function resolveMaxSteps(maxSteps: unknown, path = "config.json"): number {
+  if (maxSteps === undefined) return DEFAULT_MAX_STEPS;
+  if (typeof maxSteps !== "number" || !Number.isInteger(maxSteps) || maxSteps <= 0) {
+    throw new Error(`${path} 的 maxSteps 必須是正整數`);
+  }
+  return maxSteps;
+}
+
+export function writeConfig(config: Config, path: string): void {  writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
 }
 
 /** 只更新指定的變數，.env 裡的其他內容原樣保留 */

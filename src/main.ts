@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { COMMANDS, createAgent } from "./agent.ts";
 import { findChannel } from "./channels/index.ts";
-import { loadEnv, readConfig, resolveMemoryConfig, resolveSettings, writeConfig, type Config } from "./config.ts";
+import { loadEnv, readConfig, resolveMaxSteps, resolveMemoryConfig, resolveSettings, writeConfig, type Config } from "./config.ts";
 import { resolveContextWindow } from "./context.ts";
 import { acquireLock, agentPaths, describeAgents, ensureIdentity, judgeHomeText, parseCommand, readIdentity, readMemory, resolveJudgeHome } from "./profile.ts";
 import { createMemoryTool } from "./memory.ts";
@@ -67,8 +67,10 @@ if (ensureIdentity(paths)) console.log(`${paths.identity} 是空的，已寫入�
 const identity = readIdentity(paths);
 // 工作目錄就是啟動時的目錄（跟 Claude Code 一樣）。npm start 會先切到專案目錄，要在別處做事就用 judge 指令。
 let memoryConfig;
+let maxSteps;
 try {
   memoryConfig = resolveMemoryConfig(config.memory, paths.config);
+  maxSteps = resolveMaxSteps(config.maxSteps, paths.config);
 } catch (error) {
   fail(errorMessage(error));
 }
@@ -118,7 +120,7 @@ const agent = createAgent({
       channelName: channelDefinition.displayName,
     }),
   contextWindow,
-  maxSteps: 30,
+  maxSteps,
   switchModel,
 });
 

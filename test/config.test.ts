@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { readConfig, readConfigDraft, resolveMemoryConfig, resolveSettings, requireSetting, updateEnvFile, writeConfig } from "../src/config.ts";
+import { DEFAULT_MAX_STEPS, readConfig, readConfigDraft, resolveMaxSteps, resolveMemoryConfig, resolveSettings, requireSetting, updateEnvFile, writeConfig } from "../src/config.ts";
 import type { SetupField } from "../src/types.ts";
 
 function tempEnv(content: string): string {
@@ -39,6 +39,18 @@ test("readConfig：沒有檔案回傳 undefined；writeConfig 寫的讀得回來
   const config = { provider: selection, channel: selection };
   writeConfig(config, path);
   assert.deepEqual(readConfig(path), config);
+});
+
+test("readConfig / writeConfig：maxSteps 和 memory 都原樣保留（/model 換模型會重寫設定檔）", () => {
+  const path = tempConfigPath();
+  const config = { provider: selection, channel: selection, memory: { approval: true }, maxSteps: 80 };
+  writeConfig(config, path);
+  const read = readConfig(path)!;
+  assert.equal(read.maxSteps, 80);
+  // 模擬 switchModel：只換 provider，其餘展開保留
+  writeConfig({ ...read, provider: { id: "p", settings: { model: "新的" } } }, path);
+  assert.equal(readConfig(path)?.maxSteps, 80);
+  assert.deepEqual(readConfig(path)?.memory, { approval: true });
 });
 
 test("readConfig：缺 provider 或 channel 就報錯；readConfigDraft 不檢查", () => {
@@ -91,6 +103,20 @@ test("resolveMemoryConfig：沒寫用預設值（直接寫、2200 字），只�
   assert.deepEqual(resolveMemoryConfig({}), { approval: false, charLimit: 2200 });
   assert.deepEqual(resolveMemoryConfig({ approval: true }), { approval: true, charLimit: 2200 });
   assert.deepEqual(resolveMemoryConfig({ charLimit: 3000 }), { approval: false, charLimit: 3000 });
+});
+
+test("resolveMaxSteps：沒寫就用預設值，寫了就用寫的", () => {
+  assert.equal(resolveMaxSteps(undefined), DEFAULT_MAX_STEPS);
+  assert.equal(resolveMaxSteps(80), 80);
+  assert.equal(resolveMaxSteps(1), 1);
+});
+
+test("resolveMaxSteps：型別不對就報錯，不默默用預設值", () => {
+  assert.throws(() => resolveMaxSteps("80"), /maxSteps 必須是正整數/);
+  assert.throws(() => resolveMaxSteps(0), /maxSteps 必須是正整數/);
+  assert.throws(() => resolveMaxSteps(-1), /maxSteps 必須是正整數/);
+  assert.throws(() => resolveMaxSteps(1.5), /maxSteps 必須是正整數/);
+  assert.throws(() => resolveMaxSteps(null), /maxSteps 必須是正整數/);
 });
 
 test("resolveMemoryConfig：型別不對就報錯，不默默用預設值", () => {

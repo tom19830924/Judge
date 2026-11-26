@@ -21,8 +21,16 @@ export async function runSetup(paths: AgentPaths): Promise<void> {
     const provider = await configure(rl, "模型服務商", providers, previous?.provider, secrets);
     const channel = await configure(rl, "通訊軟體", channels, previous?.channel, secrets);
 
-    // 手動加的 memory 設定保留
-    writeConfig({ provider, channel, ...(previous?.memory ? { memory: previous.memory } : {}) }, paths.config);
+    // 手動加的 memory、maxSteps 設定保留
+    writeConfig(
+      {
+        provider,
+        channel,
+        ...(previous?.memory ? { memory: previous.memory } : {}),
+        ...(previous?.maxSteps !== undefined ? { maxSteps: previous.maxSteps } : {}),
+      },
+      paths.config,
+    );
     if (Object.keys(secrets).length > 0) updateEnvFile(secrets, paths.env);
     Object.assign(process.env, secrets);
 
